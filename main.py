@@ -1,12 +1,12 @@
 import asyncio
 import aiohttp
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import sys
-import itertools
 import importlib
 import json
 import html
+import os
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote
 
@@ -41,7 +41,11 @@ HELIUS_API_KEYS = getattr(config, 'HELIUS_API_KEYS', [])
 if not HELIUS_API_KEYS and hasattr(config, 'HELIUS_API_KEY') and config.HELIUS_API_KEY:
     HELIUS_API_KEYS = [config.HELIUS_API_KEY]
 
-helius_urls = [f"https://mainnet.helius-rpc.com/?api-key={k}" for k in HELIUS_API_KEYS if k and "your-" not in str(k)]
+helius_urls = [
+    f"https://mainnet.helius-rpc.com/?api-key={k}"
+    for k in HELIUS_API_KEYS
+    if k and "your-" not in str(k).lower() and "your_" not in str(k).lower()
+]
 
 backup_rpcs = getattr(config, 'RPC_URLS', [
     "https://api.mainnet-beta.solana.com",
@@ -51,15 +55,10 @@ backup_rpcs = getattr(config, 'RPC_URLS', [
 
 # Combine Primary Helius with Backup RPCs
 RPC_URLS = helius_urls + [url for url in backup_rpcs if url not in helius_urls]
-helius_cycle = itertools.cycle(RPC_URLS) if RPC_URLS else None
+active_rpc_index = 0
 
 last_429_warn_time = 0
-
-
-def get_next_rpc_url():
-    if helius_cycle:
-        return next(helius_cycle)
-    return RPC_URLS[0]
+last_phoenix_api_warn_time = 0
 
 
 async def send_telegram_alert(session: aiohttp.ClientSession, message: str):
@@ -103,27 +102,36 @@ async def edit_telegram_alert(session: aiohttp.ClientSession, message_id: int, m
 
 
 async def fetch_rpc(session: aiohttp.ClientSession, method: str, params: list):
-    global last_429_warn_time
+    global last_429_warn_time, active_rpc_index
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     attempts = len(RPC_URLS) if RPC_URLS else 1
 
-    for _ in range(attempts):
-        rpc_url = get_next_rpc_url()
+    if not RPC_URLS:
+        return None
+
+    # Stay on one RPC after it succeeds. The old code rotated providers on every
+    # request, so getSignaturesForAddress could return different/stale histories.
+    for offset in range(attempts):
+        rpc_index = (active_rpc_index + offset) % len(RPC_URLS)
+        rpc_url = RPC_URLS[rpc_index]
         try:
             async with session.post(rpc_url, json=payload, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if "result" in data:
+                    if data.get("result") is not None:
+                        active_rpc_index = rpc_index
                         return data["result"]
                 elif resp.status == 429:
                     # Prevent log spam: Print at most once every 15 seconds
                     now = time.time()
                     if now - last_429_warn_time > 15:
                         last_429_warn_time = now
-                        print("⏳ Helius Rate Limit (429) hit. Automatically switching to backup RPC...")
+                        print("⏳ RPC rate limit (429). Switching to the next backup RPC...")
                     continue
         except Exception:
             continue
+
+    active_rpc_index = (active_rpc_index + 1) % len(RPC_URLS)
     return None
 
 
@@ -166,14 +174,49 @@ PHOENIX_API_URL = getattr(config, "PHOENIX_API_URL", "https://perp-api.phoenix.t
 PHOENIX_API_TIMEOUT = getattr(config, "PHOENIX_API_TIMEOUT", 5)
 PHOENIX_API_PAGES = getattr(config, "PHOENIX_API_PAGES", 3)
 
-OPENAI_API_KEY = getattr(config, "OPENAI_API_KEY", "")
-OPENAI_MODEL = getattr(config, "OPENAI_MODEL", "gpt-6-luna")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or getattr(config, "OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL") or getattr(config, "OPENAI_MODEL", "gpt-6-luna")
+
+
+def clean_api_key(value):
+    key = str(value or "").strip()
+    lowered = key.casefold()
+    placeholders = (
+        "your-",
+        "your_",
+        "placeholder",
+        "replace_me",
+        "replace-me",
+        "کلید api خودت",
+        "api key here",
+    )
+    return "" if not key or any(marker in lowered for marker in placeholders) else key
+
+
+OPENAI_API_KEY = clean_api_key(OPENAI_API_KEY)
 
 
 def _as_decimal(value):
     try:
         return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _timestamp_ms(value):
+    """Phoenix trade-history timestamps are ISO strings; accept numeric forms too."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float, Decimal)):
+            number = Decimal(str(value))
+            return int(number if number > Decimal("100000000000") else number * 1000)
+        text = str(value).strip()
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp() * 1000)
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
         return None
 
 
@@ -186,6 +229,7 @@ def _fmt_number(value, max_decimals=8):
 
 async def phoenix_api_get(session: aiohttp.ClientSession, path: str, params: dict = None):
     """Fetches public Phoenix API data; failures must not stop transaction alerts."""
+    global last_phoenix_api_warn_time
     try:
         async with session.get(
             f"{PHOENIX_API_URL}{path}",
@@ -193,6 +237,10 @@ async def phoenix_api_get(session: aiohttp.ClientSession, path: str, params: dic
             timeout=PHOENIX_API_TIMEOUT,
         ) as resp:
             if resp.status != 200:
+                now = time.time()
+                if now - last_phoenix_api_warn_time > 30:
+                    last_phoenix_api_warn_time = now
+                    print(f"⚠️ Phoenix trade-data API returned HTTP {resp.status}; details may be delayed.")
                 return None
             payload = await resp.json(content_type=None)
             return payload if isinstance(payload, dict) else None
@@ -224,12 +272,22 @@ async def fetch_phoenix_api_rows(session, path, signature):
     return []
 
 
-async def fetch_market_fills_for_signature(session, symbol, signature):
-    """Fetch recent market fills and match by transaction signature."""
+async def fetch_market_fills_for_signature(session, symbol, signature, history_rows):
+    """Fetch the fill page around this transaction, then match its exact signature."""
     cursor = None
     path = f"/v1/trades/{quote(symbol, safe='')}/fills"
+    timestamps = [_timestamp_ms(row.get("timestamp")) for row in history_rows]
+    timestamps = [value for value in timestamps if value is not None]
+    time_params = {}
+    if timestamps:
+        # A narrow time window avoids paging through hundreds of newer market fills.
+        time_params = {
+            "startTime": min(timestamps) - 60_000,
+            "endTime": max(timestamps) + 60_000,
+        }
+
     for _ in range(max(1, int(PHOENIX_API_PAGES))):
-        params = {"limit": 100}
+        params = {"limit": 100, **time_params}
         if cursor:
             params["cursor"] = cursor
         payload = await phoenix_api_get(session, path, params)
@@ -268,6 +326,7 @@ async def fetch_phoenix_trade_details(session, wallet_addr, signature):
             await asyncio.sleep(0.7)
 
     if not history_rows:
+        print(f"ℹ️ No decoded Phoenix fill found yet for {signature[:8]}; AI/details skipped for this alert.")
         return []
 
     by_market = {}
@@ -284,7 +343,9 @@ async def fetch_phoenix_trade_details(session, wallet_addr, signature):
     # Market fill records supply exact base and quote quantities. History records
     # supply fees, realized PnL, side direction, and order/trade type.
     for symbol, item in by_market.items():
-        item["fills"] = await fetch_market_fills_for_signature(session, symbol, signature)
+        item["fills"] = await fetch_market_fills_for_signature(
+            session, symbol, signature, item["history"]
+        )
 
     return [
         {"symbol": symbol, **item}
@@ -292,59 +353,100 @@ async def fetch_phoenix_trade_details(session, wallet_addr, signature):
     ]
 
 
+def get_market_metrics(market):
+    history = market.get("history", [])
+    fills = market.get("fills", [])
+
+    parsed_base = [_as_decimal(row.get("baseQty")) for row in fills]
+    parsed_quote = [_as_decimal(row.get("quoteQty")) for row in fills]
+    valid_fill_rows = [
+        (abs(base), quote)
+        for base, quote in zip(parsed_base, parsed_quote)
+        if base is not None and quote is not None
+    ]
+
+    exact_fill_data = bool(valid_fill_rows)
+    if exact_fill_data:
+        base_qty = sum((base for base, _ in valid_fill_rows), Decimal("0"))
+        quote_qty = sum((quote for _, quote in valid_fill_rows), Decimal("0"))
+        price = quote_qty / base_qty if base_qty else None
+        fill_count = len(valid_fill_rows)
+    else:
+        # Rise trade history already provides signed position-size deltas and
+        # execution prices, so use those as a fallback if a fill page is delayed.
+        fallback_rows = []
+        for row in history:
+            delta = _as_decimal(row.get("baseLotsDelta"))
+            price_value = _as_decimal(row.get("price"))
+            if delta is not None and price_value is not None and delta != 0:
+                fallback_rows.append((abs(delta), price_value))
+        base_qty = sum((base for base, _ in fallback_rows), Decimal("0")) if fallback_rows else None
+        quote_qty = sum((base * price_value for base, price_value in fallback_rows), Decimal("0")) if fallback_rows else None
+        price = quote_qty / base_qty if base_qty and quote_qty is not None else None
+        fill_count = len(fallback_rows) if fallback_rows else len(history)
+
+    deltas = [_as_decimal(row.get("baseLotsDelta")) for row in history]
+    sides = {"خرید" if value > 0 else "فروش" for value in deltas if value not in (None, 0)}
+    side_text = next(iter(sides)) if len(sides) == 1 else ("ترکیبی" if sides else "نامشخص")
+
+    fees = [_as_decimal(row.get("fees")) for row in history]
+    pnls = [_as_decimal(row.get("realizedPnl")) for row in history]
+    fee_total = sum((v for v in fees if v is not None), Decimal("0")) if any(v is not None for v in fees) else None
+    pnl_total = sum((v for v in pnls if v is not None), Decimal("0")) if any(v is not None for v in pnls) else None
+
+    return {
+        "symbol": market.get("symbol"),
+        "side": side_text,
+        "base_qty": base_qty,
+        "quote_qty": quote_qty,
+        "price": price,
+        "fee_total": fee_total,
+        "pnl_total": pnl_total,
+        "trade_types": sorted({str(row.get("tradeType")) for row in history if row.get("tradeType")}),
+        "instruction_types": sorted({str(row.get("instructionType")) for row in history if row.get("instructionType")}),
+        "liquidity_types": sorted({str(row.get("liquidity")) for row in history if row.get("liquidity")}),
+        "fill_count": fill_count,
+        "exact_fill_data": exact_fill_data,
+    }
+
+
 def build_trade_details_text(markets):
     if not markets:
         return ""
 
-    sections = ["\n📈 <b>جزئیات معامله:</b>"]
+    sections = ["\n📈 <b>جزئیات اجرا</b>"]
     for market in markets[:5]:
-        symbol = market["symbol"]
-        history = market.get("history", [])
-        fills = market.get("fills", [])
+        metrics = get_market_metrics(market)
+        symbol = html.escape(str(metrics["symbol"] or "نامشخص"))
+        lines = [f"🪙 <b>{symbol}</b> · {metrics['side']}"]
 
-        base_qtys = [_as_decimal(row.get("baseQty")) for row in fills]
-        quote_qtys = [_as_decimal(row.get("quoteQty")) for row in fills]
-        base_qty = sum((v for v in base_qtys if v is not None), Decimal("0")) if fills else None
-        quote_qty = sum((v for v in quote_qtys if v is not None), Decimal("0")) if fills else None
-        price = (quote_qty / base_qty) if base_qty and quote_qty is not None else None
+        if metrics["base_qty"] is not None:
+            lines.append(f"📦 حجم اجراشده: <b>{_fmt_number(metrics['base_qty'])} {symbol}</b>")
+        else:
+            lines.append("📦 حجم اجراشده: نامشخص")
 
-        signed_deltas = [
-            _as_decimal(row.get("baseLotsDelta"))
-            for row in history
-        ]
-        sides = {"خرید" if value > 0 else "فروش" for value in signed_deltas if value not in (None, 0)}
-        side_text = next(iter(sides)) if len(sides) == 1 else ("خرید و فروش" if sides else "نامشخص")
-
-        fees = [_as_decimal(row.get("fees")) for row in history]
-        pnl = [_as_decimal(row.get("realizedPnl")) for row in history]
-        fee_total = sum((v for v in fees if v is not None), Decimal("0")) if any(v is not None for v in fees) else None
-        pnl_total = sum((v for v in pnl if v is not None), Decimal("0")) if any(v is not None for v in pnl) else None
-
-        trade_types = sorted({str(row.get("tradeType")) for row in history if row.get("tradeType")})
-        instruction_types = sorted({str(row.get("instructionType")) for row in history if row.get("instructionType")})
-        liquidity_types = sorted({str(row.get("liquidity")) for row in history if row.get("liquidity")})
-
-        lines = [f"<b>{symbol}</b> · {side_text}"]
-        lines.append(f"  حجم: {_fmt_number(base_qty)} {symbol}" if base_qty is not None else "  حجم: در منبع معامله موجود نبود")
-        if quote_qty is not None:
-            lines.append(f"  ارزش معامله: {_fmt_number(quote_qty)} PhUSD")
-        if price is not None:
-            lines.append(f"  میانگین قیمت اجرا: {_fmt_number(price)} PhUSD")
-        if fee_total is not None:
-            lines.append(f"  کارمزد: {_fmt_number(fee_total)} PhUSD")
-        if pnl_total is not None:
-            lines.append(f"  PnL تحقق‌یافته در همین اجرا: {_fmt_number(pnl_total)} PhUSD")
-        if trade_types:
-            lines.append(f"  نوع معامله: {', '.join(trade_types)}")
-        if instruction_types:
-            lines.append(f"  دستور: {', '.join(instruction_types)}")
-        if liquidity_types:
-            lines.append(f"  نقدشوندگی: {', '.join(liquidity_types)}")
+        if metrics["price"] is not None:
+            lines.append(f"💹 میانگین قیمت اجرا: <b>{_fmt_number(metrics['price'])} PhUSD</b>")
+        if metrics["quote_qty"] is not None:
+            quote_label = "ارزش معامله" if metrics["exact_fill_data"] else "ارزش برآوردی معامله"
+            lines.append(f"💰 {quote_label}: <b>{_fmt_number(metrics['quote_qty'])} PhUSD</b>")
+        if metrics["fee_total"] is not None:
+            lines.append(f"🧾 کارمزد: <b>{_fmt_number(metrics['fee_total'])} PhUSD</b>")
+        if metrics["pnl_total"] is not None:
+            lines.append(f"📊 PnL تحقق‌یافته: <b>{_fmt_number(metrics['pnl_total'])} PhUSD</b>")
+        if metrics["fill_count"]:
+            lines.append(f"🔢 تعداد اجراها: {metrics['fill_count']}")
+        if metrics["trade_types"]:
+            lines.append(f"⚡ نوع معامله: {', '.join(metrics['trade_types'])}")
+        if metrics["instruction_types"]:
+            lines.append(f"🛠 دستور: {', '.join(metrics['instruction_types'])}")
+        if metrics["liquidity_types"]:
+            lines.append(f"💧 نقدشوندگی: {', '.join(metrics['liquidity_types'])}")
         sections.append("\n".join(lines))
 
     if len(markets) > 5:
         sections.append(f"… و {len(markets) - 5} بازار دیگر")
-    return "\n\n" + "\n\n".join(sections)
+    return "\n\n".join(sections)
 
 
 async def analyze_trade_with_ai(session, markets):
@@ -354,28 +456,23 @@ async def analyze_trade_with_ai(session, markets):
 
     facts = []
     for market in markets:
-        fills = market.get("fills", [])
-        history = market.get("history", [])
-        base_qty = sum((_as_decimal(row.get("baseQty")) or Decimal("0")) for row in fills) if fills else None
-        quote_qty = sum((_as_decimal(row.get("quoteQty")) or Decimal("0")) for row in fills) if fills else None
-        signed_deltas = [_as_decimal(row.get("baseLotsDelta")) for row in history]
-        sides = {"buy" if value > 0 else "sell" for value in signed_deltas if value not in (None, 0)}
-        side = next(iter(sides)) if len(sides) == 1 else ("mixed" if sides else None)
+        metrics = get_market_metrics(market)
         facts.append({
-            "symbol": market.get("symbol"),
-            "side": side,
-            "base_volume": str(base_qty) if base_qty is not None else None,
-            "quote_volume_PhUSD": str(quote_qty) if quote_qty is not None else None,
-            "price_PhUSD": str(quote_qty / base_qty) if base_qty and quote_qty is not None else None,
-            "trade_types": sorted({str(row.get("tradeType")) for row in history if row.get("tradeType")}),
-            "fees_PhUSD": str(sum((_as_decimal(row.get("fees")) or Decimal("0")) for row in history)) if history else None,
-            "realized_pnl_PhUSD": str(sum((_as_decimal(row.get("realizedPnl")) or Decimal("0")) for row in history)) if history else None,
+            "symbol": metrics["symbol"],
+            "side": metrics["side"],
+            "base_volume": str(metrics["base_qty"]) if metrics["base_qty"] is not None else None,
+            "quote_volume_PhUSD": str(metrics["quote_qty"]) if metrics["quote_qty"] is not None else None,
+            "execution_price_PhUSD": str(metrics["price"]) if metrics["price"] is not None else None,
+            "trade_types": metrics["trade_types"],
+            "fees_PhUSD": str(metrics["fee_total"]) if metrics["fee_total"] is not None else None,
+            "realized_pnl_PhUSD": str(metrics["pnl_total"]) if metrics["pnl_total"] is not None else None,
         })
 
     payload = {
         "model": OPENAI_MODEL,
         "store": False,
-        "max_output_tokens": 100,
+        "reasoning": {"effort": "low"},
+        "max_output_tokens": 180,
         "instructions": (
             "به فارسی و حداکثر در دو جمله، فقط همین داده‌های تأییدشده را توضیح بده. "
             "سمت را فقط از فیلد side بخوان؛ قیمت، حجم، سود، علت یا سیگنال را حدس نزن. "
@@ -391,6 +488,10 @@ async def analyze_trade_with_ai(session, markets):
             timeout=8,
         ) as resp:
             if resp.status != 200:
+                error_body = (await resp.text()).replace("\n", " ")[:300]
+                print(
+                    f"⚠️ AI analysis failed (OpenAI HTTP {resp.status}): {error_body}"
+                )
                 return None
             response = await resp.json(content_type=None)
         texts = []
@@ -398,8 +499,12 @@ async def analyze_trade_with_ai(session, markets):
             for content in output_item.get("content", []):
                 if content.get("type") == "output_text" and content.get("text"):
                     texts.append(content["text"].strip())
-        return " ".join(texts)[:700] or None
-    except Exception:
+        if not texts:
+            print("⚠️ OpenAI returned no text for the trade analysis.")
+            return None
+        return " ".join(texts)[:700]
+    except Exception as exc:
+        print(f"⚠️ AI analysis request failed: {type(exc).__name__}")
         return None
 
 
@@ -428,26 +533,56 @@ async def send_and_enrich_alert(session, alert_text, wallet_addr, signature, pho
         print(f"⚠️ Phoenix details enrichment failed for {signature[:8]}: {exc}")
 
 
-async def monitor_wallet(session: aiohttp.ClientSession, wallet_addr: str, wallet_name: str, last_signatures: dict):
+async def monitor_wallet(
+    session: aiohttp.ClientSession,
+    wallet_addr: str,
+    wallet_name: str,
+    last_signatures: dict,
+    last_signature_slots: dict,
+):
     sigs = await fetch_rpc(session, "getSignaturesForAddress", [wallet_addr, {"limit": 20}])
     if not sigs:
         return
 
+    latest = sigs[0]
+    latest_signature = latest.get("signature")
+    latest_slot = latest.get("slot")
     last_sig = last_signatures.get(wallet_addr)
     if last_sig is None:
-        last_signatures[wallet_addr] = sigs[0]["signature"]
+        # Establish a fresh baseline on every process start; never replay history.
+        last_signatures[wallet_addr] = latest_signature
+        last_signature_slots[wallet_addr] = latest_slot
         print(f"✅ Monitoring active for [{wallet_name}]")
         return
 
+    previous_slot = last_signature_slots.get(wallet_addr)
+    if previous_slot is not None and latest_slot is not None and latest_slot < previous_slot:
+        # Some public RPCs can lag behind the last response. Treat that response
+        # as stale and do not mistake its old signatures for newly seen trades.
+        print(f"⏳ Ignoring stale RPC history for [{wallet_name}] (slot moved backwards).")
+        return
+
     new_sigs = []
+    baseline_found = False
     for sig_info in sigs:
         sig = sig_info["signature"]
         if sig == last_sig:
+            baseline_found = True
             break
         new_sigs.append(sig_info)
 
+    if not baseline_found:
+        # The cursor falling out of the 20-signature window is ambiguous: it may
+        # be an RPC history gap. Re-sync without sending that batch as old alerts.
+        if latest_signature:
+            last_signatures[wallet_addr] = latest_signature
+            last_signature_slots[wallet_addr] = latest_slot
+        print(f"⚠️ Signature gap for [{wallet_name}]; re-synced without replaying older transactions.")
+        return
+
     if new_sigs:
         last_signatures[wallet_addr] = new_sigs[0]["signature"]
+        last_signature_slots[wallet_addr] = new_sigs[0].get("slot")
 
         for sig_info in reversed(new_sigs):
             sig = sig_info["signature"]
@@ -496,7 +631,10 @@ async def monitor_wallet(session: aiohttp.ClientSession, wallet_addr: str, walle
 
 async def main():
     print(f"🚀 Phoenix Tracker Active using [{config_name}.py]...")
+    if not OPENAI_API_KEY:
+        print("⚠️ AI analysis is disabled: OPENAI_API_KEY is empty or still a placeholder in this config.")
     last_signatures = {}
+    last_signature_slots = {}
 
     async with aiohttp.ClientSession() as session:
         await send_telegram_alert(session, f"🚀 <b>Phoenix Multi-Wallet Tracker Active ({config_name}.py).</b>")
@@ -505,7 +643,7 @@ async def main():
             start_time = time.time()
             
             tasks = [
-                monitor_wallet(session, addr, name, last_signatures)
+                monitor_wallet(session, addr, name, last_signatures, last_signature_slots)
                 for addr, name in TARGET_WALLETS.items()
             ]
             await asyncio.gather(*tasks)
