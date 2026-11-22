@@ -1,5 +1,8 @@
 # === Bot Configuration ===
 
+OPENAI_API_KEY = "کلید API خودت"
+OPENAI_MODEL = "gpt-6-luna"
+
 # Telegram Settings
 TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
