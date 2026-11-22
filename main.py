@@ -3,6 +3,7 @@ import aiohttp
 import time
 from datetime import datetime, timezone
 import sys
+import itertools
 import importlib
 import json
 import html
@@ -40,28 +41,54 @@ PHOENIX_PROGRAMS = {
 HELIUS_API_KEYS = getattr(config, 'HELIUS_API_KEYS', [])
 if not HELIUS_API_KEYS and hasattr(config, 'HELIUS_API_KEY') and config.HELIUS_API_KEY:
     HELIUS_API_KEYS = [config.HELIUS_API_KEY]
+elif isinstance(HELIUS_API_KEYS, str):
+    HELIUS_API_KEYS = [HELIUS_API_KEYS]
 
 helius_urls = [
-    f"https://mainnet.helius-rpc.com/?api-key={k}"
+    f"https://mainnet.helius-rpc.com/?api-key={quote(str(k).strip(), safe='')}"
     for k in HELIUS_API_KEYS
-    if k and "your-" not in str(k).lower() and "your_" not in str(k).lower()
+    if k
+    and "your-" not in str(k).lower()
+    and "your_" not in str(k).lower()
+    and "placeholder" not in str(k).lower()
+    and "کلید api خودت" not in str(k).casefold()
 ]
 
-backup_rpcs = getattr(config, 'RPC_URLS', [
+configured_rpcs = getattr(config, 'RPC_URLS', [
     "https://api.mainnet-beta.solana.com",
     "https://solana-rpc.publicnode.com",
     "https://rpc.ankr.com/solana"
 ])
+if isinstance(configured_rpcs, str):
+    configured_rpcs = [configured_rpcs]
+
+# Helius endpoints are built one-by-one from HELIUS_API_KEYS above. This also
+# drops malformed entries like f"...?api-key={HELIUS_API_KEYS}" from config.py.
+backup_rpcs = []
+for configured_rpc in configured_rpcs:
+    rpc_url = str(configured_rpc).strip()
+    if not rpc_url or rpc_url in backup_rpcs:
+        continue
+    if "mainnet.helius-rpc.com" in rpc_url.lower():
+        if helius_urls:
+            continue
+        if "api-key=" not in rpc_url.lower() or "[" in rpc_url or "]" in rpc_url:
+            continue
+    backup_rpcs.append(rpc_url)
 
 # Combine Primary Helius with Backup RPCs
-RPC_URLS = helius_urls + [url for url in backup_rpcs if url not in helius_urls]
-active_rpc_index = 0
-RPC_CONCURRENCY = max(1, int(getattr(config, "RPC_CONCURRENCY", 3)))
-rpc_semaphore = asyncio.Semaphore(RPC_CONCURRENCY)
+RPC_URLS = list(dict.fromkeys(helius_urls + backup_rpcs))
+helius_cycle = itertools.cycle(RPC_URLS) if RPC_URLS else None
 
 last_429_warn_time = 0
+last_rpc_error_warn_time = 0
 last_phoenix_api_warn_time = 0
-last_rpc_stale_warn_time = 0
+
+
+def get_next_rpc_url():
+    if helius_cycle:
+        return next(helius_cycle)
+    return None
 
 
 async def send_telegram_alert(session: aiohttp.ClientSession, message: str):
@@ -105,65 +132,45 @@ async def edit_telegram_alert(session: aiohttp.ClientSession, message_id: int, m
 
 
 async def fetch_rpc(session: aiohttp.ClientSession, method: str, params: list):
-    global last_429_warn_time, last_rpc_stale_warn_time, active_rpc_index
-    min_context_slot = None
-    request_params = list(params)
-    if method == "getSignaturesForAddress" and len(request_params) > 1:
-        rpc_config = dict(request_params[1]) if isinstance(request_params[1], dict) else {}
-        min_context_slot = rpc_config.get("minContextSlot")
-        request_params[1] = rpc_config
-
-    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": request_params}
+    global last_429_warn_time, last_rpc_error_warn_time
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     attempts = len(RPC_URLS) if RPC_URLS else 1
-
     if not RPC_URLS:
+        print("⚠️ No RPC endpoint is configured.")
         return None
 
-    # Stay on one RPC after it succeeds. The old code rotated providers on every
-    # request, so getSignaturesForAddress could return different/stale histories.
-    stale_endpoints = 0
     for offset in range(attempts):
-        rpc_index = (active_rpc_index + offset) % len(RPC_URLS)
-        rpc_url = RPC_URLS[rpc_index]
+        rpc_url = get_next_rpc_url()
+        if not rpc_url:
+            return None
         try:
-            async with rpc_semaphore:
-                async with session.post(rpc_url, json=payload, timeout=5) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("result") is not None:
-                            result = data["result"]
-                            if method == "getSignaturesForAddress" and min_context_slot is not None:
-                                latest_slot = result[0].get("slot") if isinstance(result, list) and result else None
-                                # A successful HTTP response can still come from an RPC whose
-                                # address-history index is behind the last signature we saw.
-                                # Reject it here and try the next configured provider.
-                                if latest_slot is None or latest_slot < min_context_slot:
-                                    stale_endpoints += 1
-                                    continue
-                            active_rpc_index = rpc_index
-                            return result
-                        rpc_error = str(data.get("error", "")).casefold()
-                        if min_context_slot is not None and (
-                            "minimum context slot" in rpc_error or "mincontextslot" in rpc_error
-                        ):
-                            stale_endpoints += 1
-                            continue
-                    elif resp.status == 429:
-                        # Prevent log spam: Print at most once every 15 seconds
+            async with session.post(rpc_url, json=payload, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("result") is not None:
+                        return data["result"]
+                    # HTTP 200 can still contain a JSON-RPC error (for example,
+                    # an invalid or exhausted Helius key); try the next endpoint.
+                    if data.get("error"):
                         now = time.time()
-                        if now - last_429_warn_time > 15:
-                            last_429_warn_time = now
-                            print("⏳ RPC rate limit (429). Switching to the next backup RPC...")
+                        if now - last_rpc_error_warn_time > 15:
+                            last_rpc_error_warn_time = now
+                            print("⚠️ RPC returned a JSON-RPC error; switching to the next configured RPC/key...")
                         continue
+                elif resp.status == 429:
+                    now = time.time()
+                    if now - last_429_warn_time > 15:
+                        last_429_warn_time = now
+                        print("⏳ RPC rate limit (429). Switching to the next configured RPC/key...")
+                    continue
+                else:
+                    now = time.time()
+                    if now - last_rpc_error_warn_time > 15:
+                        last_rpc_error_warn_time = now
+                        print(f"⚠️ RPC returned HTTP {resp.status}; switching to the next configured RPC/key...")
         except Exception:
             continue
 
-    if stale_endpoints:
-        now = time.time()
-        if now - last_rpc_stale_warn_time > 15:
-            last_rpc_stale_warn_time = now
-            print("⏳ RPC backups are behind the last seen slot; waiting for a caught-up provider.")
-    active_rpc_index = (active_rpc_index + 1) % len(RPC_URLS)
     return None
 
 
@@ -570,37 +577,18 @@ async def monitor_wallet(
     wallet_addr: str,
     wallet_name: str,
     last_signatures: dict,
-    last_signature_slots: dict,
 ):
-    previous_slot = last_signature_slots.get(wallet_addr)
-    signature_config = {"limit": 20}
-    if previous_slot is not None:
-        # Ask each provider to evaluate the request at least at the cursor slot.
-        # Older backups return an RPC error and fetch_rpc tries another endpoint.
-        signature_config["minContextSlot"] = previous_slot
-    sigs = await fetch_rpc(
-        session,
-        "getSignaturesForAddress",
-        [wallet_addr, signature_config],
-    )
+    sigs = await fetch_rpc(session, "getSignaturesForAddress", [wallet_addr, {"limit": 20}])
     if not sigs:
         return
 
     latest = sigs[0]
     latest_signature = latest.get("signature")
-    latest_slot = latest.get("slot")
     last_sig = last_signatures.get(wallet_addr)
     if last_sig is None:
         # Establish a fresh baseline on every process start; never replay history.
         last_signatures[wallet_addr] = latest_signature
-        last_signature_slots[wallet_addr] = latest_slot
         print(f"✅ Monitoring active for [{wallet_name}]")
-        return
-
-    if previous_slot is not None and latest_slot is not None and latest_slot < previous_slot:
-        # Some public RPCs can lag behind the last response. Treat that response
-        # as stale and do not mistake its old signatures for newly seen trades.
-        print(f"⏳ Ignoring stale RPC history for [{wallet_name}] (slot moved backwards).")
         return
 
     new_sigs = []
@@ -613,17 +601,14 @@ async def monitor_wallet(
         new_sigs.append(sig_info)
 
     if not baseline_found:
-        # The cursor falling out of the 20-signature window is ambiguous: it may
-        # be an RPC history gap. Re-sync without sending that batch as old alerts.
-        if latest_signature:
-            last_signatures[wallet_addr] = latest_signature
-            last_signature_slots[wallet_addr] = latest_slot
-        print(f"⚠️ Signature gap for [{wallet_name}]; re-synced without replaying older transactions.")
+        # RPC providers may disagree or a backup may be behind. Keep the last
+        # known signature; the round-robin RPC selector will try another provider
+        # on the next poll. Never replay a page whose relation to the cursor is unknown.
+        print(f"⏳ RPC history for [{wallet_name}] did not include the last signature; trying another provider.")
         return
 
     if new_sigs:
         last_signatures[wallet_addr] = new_sigs[0]["signature"]
-        last_signature_slots[wallet_addr] = new_sigs[0].get("slot")
 
         for sig_info in reversed(new_sigs):
             sig = sig_info["signature"]
@@ -672,10 +657,10 @@ async def monitor_wallet(
 
 async def main():
     print(f"🚀 Phoenix Tracker Active using [{config_name}.py]...")
+    print(f"🔌 RPC providers ready: {len(RPC_URLS)} (Helius keys: {len(helius_urls)}, backups: {len(backup_rpcs)}).")
     if not OPENAI_API_KEY:
         print("⚠️ AI analysis is disabled: OPENAI_API_KEY is empty or still a placeholder in this config.")
     last_signatures = {}
-    last_signature_slots = {}
 
     async with aiohttp.ClientSession() as session:
         await send_telegram_alert(session, f"🚀 <b>Phoenix Multi-Wallet Tracker Active ({config_name}.py).</b>")
@@ -684,7 +669,7 @@ async def main():
             start_time = time.time()
             
             tasks = [
-                monitor_wallet(session, addr, name, last_signatures, last_signature_slots)
+                monitor_wallet(session, addr, name, last_signatures)
                 for addr, name in TARGET_WALLETS.items()
             ]
             await asyncio.gather(*tasks)
