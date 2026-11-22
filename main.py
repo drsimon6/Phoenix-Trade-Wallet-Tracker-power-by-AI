@@ -56,9 +56,12 @@ backup_rpcs = getattr(config, 'RPC_URLS', [
 # Combine Primary Helius with Backup RPCs
 RPC_URLS = helius_urls + [url for url in backup_rpcs if url not in helius_urls]
 active_rpc_index = 0
+RPC_CONCURRENCY = max(1, int(getattr(config, "RPC_CONCURRENCY", 3)))
+rpc_semaphore = asyncio.Semaphore(RPC_CONCURRENCY)
 
 last_429_warn_time = 0
 last_phoenix_api_warn_time = 0
+last_rpc_stale_warn_time = 0
 
 
 async def send_telegram_alert(session: aiohttp.ClientSession, message: str):
@@ -102,8 +105,15 @@ async def edit_telegram_alert(session: aiohttp.ClientSession, message_id: int, m
 
 
 async def fetch_rpc(session: aiohttp.ClientSession, method: str, params: list):
-    global last_429_warn_time, active_rpc_index
-    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    global last_429_warn_time, last_rpc_stale_warn_time, active_rpc_index
+    min_context_slot = None
+    request_params = list(params)
+    if method == "getSignaturesForAddress" and len(request_params) > 1:
+        rpc_config = dict(request_params[1]) if isinstance(request_params[1], dict) else {}
+        min_context_slot = rpc_config.get("minContextSlot")
+        request_params[1] = rpc_config
+
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": request_params}
     attempts = len(RPC_URLS) if RPC_URLS else 1
 
     if not RPC_URLS:
@@ -111,26 +121,48 @@ async def fetch_rpc(session: aiohttp.ClientSession, method: str, params: list):
 
     # Stay on one RPC after it succeeds. The old code rotated providers on every
     # request, so getSignaturesForAddress could return different/stale histories.
+    stale_endpoints = 0
     for offset in range(attempts):
         rpc_index = (active_rpc_index + offset) % len(RPC_URLS)
         rpc_url = RPC_URLS[rpc_index]
         try:
-            async with session.post(rpc_url, json=payload, timeout=5) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("result") is not None:
-                        active_rpc_index = rpc_index
-                        return data["result"]
-                elif resp.status == 429:
-                    # Prevent log spam: Print at most once every 15 seconds
-                    now = time.time()
-                    if now - last_429_warn_time > 15:
-                        last_429_warn_time = now
-                        print("⏳ RPC rate limit (429). Switching to the next backup RPC...")
-                    continue
+            async with rpc_semaphore:
+                async with session.post(rpc_url, json=payload, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("result") is not None:
+                            result = data["result"]
+                            if method == "getSignaturesForAddress" and min_context_slot is not None:
+                                latest_slot = result[0].get("slot") if isinstance(result, list) and result else None
+                                # A successful HTTP response can still come from an RPC whose
+                                # address-history index is behind the last signature we saw.
+                                # Reject it here and try the next configured provider.
+                                if latest_slot is None or latest_slot < min_context_slot:
+                                    stale_endpoints += 1
+                                    continue
+                            active_rpc_index = rpc_index
+                            return result
+                        rpc_error = str(data.get("error", "")).casefold()
+                        if min_context_slot is not None and (
+                            "minimum context slot" in rpc_error or "mincontextslot" in rpc_error
+                        ):
+                            stale_endpoints += 1
+                            continue
+                    elif resp.status == 429:
+                        # Prevent log spam: Print at most once every 15 seconds
+                        now = time.time()
+                        if now - last_429_warn_time > 15:
+                            last_429_warn_time = now
+                            print("⏳ RPC rate limit (429). Switching to the next backup RPC...")
+                        continue
         except Exception:
             continue
 
+    if stale_endpoints:
+        now = time.time()
+        if now - last_rpc_stale_warn_time > 15:
+            last_rpc_stale_warn_time = now
+            print("⏳ RPC backups are behind the last seen slot; waiting for a caught-up provider.")
     active_rpc_index = (active_rpc_index + 1) % len(RPC_URLS)
     return None
 
@@ -540,7 +572,17 @@ async def monitor_wallet(
     last_signatures: dict,
     last_signature_slots: dict,
 ):
-    sigs = await fetch_rpc(session, "getSignaturesForAddress", [wallet_addr, {"limit": 20}])
+    previous_slot = last_signature_slots.get(wallet_addr)
+    signature_config = {"limit": 20}
+    if previous_slot is not None:
+        # Ask each provider to evaluate the request at least at the cursor slot.
+        # Older backups return an RPC error and fetch_rpc tries another endpoint.
+        signature_config["minContextSlot"] = previous_slot
+    sigs = await fetch_rpc(
+        session,
+        "getSignaturesForAddress",
+        [wallet_addr, signature_config],
+    )
     if not sigs:
         return
 
@@ -555,7 +597,6 @@ async def monitor_wallet(
         print(f"✅ Monitoring active for [{wallet_name}]")
         return
 
-    previous_slot = last_signature_slots.get(wallet_addr)
     if previous_slot is not None and latest_slot is not None and latest_slot < previous_slot:
         # Some public RPCs can lag behind the last response. Treat that response
         # as stale and do not mistake its old signatures for newly seen trades.
