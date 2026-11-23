@@ -133,22 +133,6 @@ def get_next_rpc_index():
     return index
 
 
-BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
-
-def base58_decoded_length(value):
-    if not isinstance(value, str) or not value:
-        return None
-    number = 0
-    for char in value:
-        digit = BASE58_ALPHABET.find(char)
-        if digit < 0:
-            return None
-        number = number * 58 + digit
-    leading_zeros = len(value) - len(value.lstrip("1"))
-    return leading_zeros + ((number.bit_length() + 7) // 8)
-
-
 async def send_telegram_alert(session: aiohttp.ClientSession, message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram bot token or chat ID is missing from the active config.")
@@ -193,23 +177,6 @@ async def edit_telegram_alert(session: aiohttp.ClientSession, message_id: int, m
 
 async def fetch_rpc(session: aiohttp.ClientSession, method: str, params: list):
     global last_429_warn_time, last_rpc_error_warn_time
-    if method == "getSignaturesForAddress" and params:
-        decoded_length = base58_decoded_length(params[0])
-        if decoded_length != 32:
-            print(
-                "❌ Invalid wallet address passed to getSignaturesForAddress "
-                f"(base58 decoded bytes: {decoded_length}; expected 32)."
-            )
-            return None
-    elif method == "getTransaction" and params:
-        decoded_length = base58_decoded_length(params[0])
-        if decoded_length != 64:
-            print(
-                "❌ Invalid transaction signature passed to getTransaction "
-                f"(base58 decoded bytes: {decoded_length}; expected 64)."
-            )
-            return None
-
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     attempts = len(RPC_URLS)
     if not attempts:
@@ -219,6 +186,7 @@ async def fetch_rpc(session: aiohttp.ClientSession, method: str, params: list):
     first_index = get_next_rpc_index()
     if first_index is None:
         return None
+    invalid_param_error = None
     for offset in range(attempts):
         provider_index = (first_index + offset) % attempts
         rpc_url = RPC_URLS[provider_index]
@@ -242,9 +210,12 @@ async def fetch_rpc(session: aiohttp.ClientSession, method: str, params: list):
                                 print(f"⚠️ {provider_label} JSON error in {method} ({detail[:180]}).")
                             error = data["error"]
                             if isinstance(error, dict) and error.get("code") == -32602:
-                                # Invalid parameters are identical across RPC providers;
-                                # retrying all keys only creates more 429s.
-                                return None
+                                # Test one alternate provider, then stop if it reports
+                                # the same invalid-parameter error for the same request.
+                                error_text = str(error.get("message", ""))
+                                if invalid_param_error == error_text:
+                                    return None
+                                invalid_param_error = error_text
                             print(f"↪️ Retrying {method} with the next RPC/key...")
                             continue
                     elif resp.status == 429:
@@ -550,6 +521,8 @@ def build_trade_details(markets):
 
 
 async def monitor_wallet(session: aiohttp.ClientSession, wallet_addr: str, wallet_name: str, last_signatures: dict, seen_signatures: dict):
+    wallet_addr = str(wallet_addr).strip()
+    wallet_name = str(wallet_name)
     sigs = await fetch_rpc(session, "getSignaturesForAddress", [wallet_addr, {"limit": 20}])
     if not sigs:
         return
