@@ -133,6 +133,22 @@ def get_next_rpc_index():
     return index
 
 
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def base58_decoded_length(value):
+    if not isinstance(value, str) or not value:
+        return None
+    number = 0
+    for char in value:
+        digit = BASE58_ALPHABET.find(char)
+        if digit < 0:
+            return None
+        number = number * 58 + digit
+    leading_zeros = len(value) - len(value.lstrip("1"))
+    return leading_zeros + ((number.bit_length() + 7) // 8)
+
+
 async def send_telegram_alert(session: aiohttp.ClientSession, message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram bot token or chat ID is missing from the active config.")
@@ -177,6 +193,23 @@ async def edit_telegram_alert(session: aiohttp.ClientSession, message_id: int, m
 
 async def fetch_rpc(session: aiohttp.ClientSession, method: str, params: list):
     global last_429_warn_time, last_rpc_error_warn_time
+    if method == "getSignaturesForAddress" and params:
+        decoded_length = base58_decoded_length(params[0])
+        if decoded_length != 32:
+            print(
+                "❌ Invalid wallet address passed to getSignaturesForAddress "
+                f"(base58 decoded bytes: {decoded_length}; expected 32)."
+            )
+            return None
+    elif method == "getTransaction" and params:
+        decoded_length = base58_decoded_length(params[0])
+        if decoded_length != 64:
+            print(
+                "❌ Invalid transaction signature passed to getTransaction "
+                f"(base58 decoded bytes: {decoded_length}; expected 64)."
+            )
+            return None
+
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     attempts = len(RPC_URLS)
     if not attempts:
@@ -187,7 +220,9 @@ async def fetch_rpc(session: aiohttp.ClientSession, method: str, params: list):
     if first_index is None:
         return None
     for offset in range(attempts):
-        rpc_url = RPC_URLS[(first_index + offset) % attempts]
+        provider_index = (first_index + offset) % attempts
+        rpc_url = RPC_URLS[provider_index]
+        provider_label = f"RPC #{provider_index + 1}/{attempts}"
         try:
             async with rpc_semaphore:
                 async with session.post(rpc_url, json=payload, timeout=5) as resp:
@@ -204,19 +239,25 @@ async def fetch_rpc(session: aiohttp.ClientSession, method: str, params: list):
                                     detail = f"{error.get('code', '')} {error.get('message', '')}".strip()
                                 else:
                                     detail = str(error)
-                                print(f"⚠️ RPC JSON error ({detail[:180]}); trying the next key/endpoint...")
+                                print(f"⚠️ {provider_label} JSON error in {method} ({detail[:180]}).")
+                            error = data["error"]
+                            if isinstance(error, dict) and error.get("code") == -32602:
+                                # Invalid parameters are identical across RPC providers;
+                                # retrying all keys only creates more 429s.
+                                return None
+                            print(f"↪️ Retrying {method} with the next RPC/key...")
                             continue
                     elif resp.status == 429:
                         now = time.time()
                         if now - last_429_warn_time > 15:
                             last_429_warn_time = now
-                            print("⏳ RPC rate limit (429); automatically trying the next key/endpoint...")
+                            print(f"⏳ {provider_label} rate limit (429) in {method}; trying the next key/endpoint...")
                         continue
                     else:
                         now = time.time()
                         if now - last_rpc_error_warn_time > 15:
                             last_rpc_error_warn_time = now
-                            print(f"⚠️ RPC returned HTTP {resp.status}; automatically trying the next key/endpoint...")
+                            print(f"⚠️ {provider_label} returned HTTP {resp.status} for {method}; trying the next key/endpoint...")
         except Exception as exc:
             now = time.time()
             if now - last_rpc_error_warn_time > 15:
