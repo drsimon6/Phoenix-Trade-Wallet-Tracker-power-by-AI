@@ -94,7 +94,10 @@ rpc_cooldowns = [0.0 for _ in RPC_URLS]
 last_signature_gap_warn = {}
 inflight_signatures = set()
 background_tasks = set()
+old_history_skipped = set()
 NO_SIGNATURE_BASELINE = "__NO_SIGNATURE_BASELINE__"
+STARTUP_BACKFILL_SECONDS = 60 * 60
+BOT_STARTED_AT = time.time()
 
 LINKED_SIGNERS_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "linked_signers.json"
@@ -116,6 +119,15 @@ def is_valid_solana_address(address):
     decoded = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
     leading_zeroes = len(address) - len(address.lstrip("1"))
     return len((b"\x00" * leading_zeroes) + decoded) == 32
+
+
+def is_within_startup_window(sig_info):
+    """Allow at most the hour before startup plus every transaction after startup."""
+    try:
+        block_time = float(sig_info.get("blockTime"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return block_time >= BOT_STARTED_AT - STARTUP_BACKFILL_SECONDS
 
 
 def load_linked_signers():
@@ -739,60 +751,89 @@ async def monitor_wallet(session: aiohttp.ClientSession, owner_addr: str, wallet
         return
 
     last_sig = last_signatures.get(source_addr)
-    cursor_validator = None
-    if last_sig is not None and last_sig != NO_SIGNATURE_BASELINE:
-        cursor_validator = lambda rows: isinstance(rows, list) and any(
-            isinstance(item, dict) and item.get("signature") == last_sig for item in rows
-        )
-    sigs = await fetch_rpc(
-        session,
-        "getSignaturesForAddress",
-        [source_addr, {"limit": 100}],
-        result_validator=cursor_validator,
-    )
+    sigs = await fetch_rpc(session, "getSignaturesForAddress", [source_addr, {"limit": 100}])
     if sigs is None:
         return
-
-    if last_sig is None and not sigs:
-        last_signatures[source_addr] = NO_SIGNATURE_BASELINE
-        print(f"✅ Monitoring active for [{wallet_name}] (waiting for first transaction)")
-        return
-    if last_sig == NO_SIGNATURE_BASELINE and not sigs:
+    if not isinstance(sigs, list):
         return
 
     seen = seen_signatures.setdefault(owner_addr, {})
-    if last_sig is None:
-        last_signatures[source_addr] = sigs[0]["signature"]
-        for sig_info in sigs:
-            seen[sig_info["signature"]] = None
-        save_seen_signatures(seen_signatures)
-        if source_addr == owner_addr:
-            print(f"✅ Monitoring active for [{wallet_name}]")
-        else:
-            print(f"✅ Monitoring linked Phoenix signer for [{wallet_name}]")
+    if not sigs:
+        if last_sig is None:
+            last_signatures[source_addr] = NO_SIGNATURE_BASELINE
+            label = "" if source_addr == owner_addr else " linked signer"
+            print(f"✅ Monitoring active{label} for [{wallet_name}] (waiting for first transaction)")
         return
+
+    cursor_found = False
+    if last_sig not in (None, NO_SIGNATURE_BASELINE):
+        cursor_found = any(item.get("signature") == last_sig for item in sigs if isinstance(item, dict))
+        if not cursor_found:
+            # A stale RPC head can be older than the saved cursor. Ask another
+            # provider for a page containing that cursor before processing the
+            # stale page. If none has it, the one-hour cutoff below is the guard.
+            stale_page = sigs
+            alternate_page = await fetch_rpc(
+                session,
+                "getSignaturesForAddress",
+                [source_addr, {"limit": 100}],
+                result_validator=lambda rows: isinstance(rows, list) and any(
+                    isinstance(item, dict) and item.get("signature") == last_sig for item in rows
+                ),
+            )
+            if isinstance(alternate_page, list):
+                sigs = alternate_page
+                cursor_found = True
+            else:
+                sigs = stale_page
+                now = time.time()
+                if now - last_signature_gap_warn.get(source_addr, 0) > 15:
+                    last_signature_gap_warn[source_addr] = now
+                    print(f"⏳ RPC cursor missing for [{wallet_name}]; using only transactions from the last hour.")
 
     new_sigs = []
-    baseline_found = last_sig == NO_SIGNATURE_BASELINE
-    if baseline_found:
-        new_sigs = list(sigs)
-    else:
+    if cursor_found:
         for sig_info in sigs:
-            sig = sig_info["signature"]
-            if sig == last_sig:
-                baseline_found = True
+            if sig_info.get("signature") == last_sig:
                 break
             new_sigs.append(sig_info)
+    else:
+        recent_indexes = []
+        for index, sig_info in enumerate(sigs):
+            sig = sig_info.get("signature") if isinstance(sig_info, dict) else None
+            if not sig:
+                continue
+            if is_within_startup_window(sig_info):
+                recent_indexes.append(index)
+            else:
+                seen[sig] = None
 
-    if not baseline_found:
-        # Multiple RPCs may have different history heads. Do not advance to an
-        # unverified page and accidentally replay it; the round-robin will try
-        # a different key/provider on the next request.
-        now = time.time()
-        if now - last_signature_gap_warn.get(source_addr, 0) > 15:
-            last_signature_gap_warn[source_addr] = now
-            print(f"⏳ RPC history for [{wallet_name}] missed its cursor; waiting for another provider.")
-        return
+        if not recent_indexes:
+            # First baseline or an RPC returning old history: remember its head,
+            # but never alert any item outside the one-hour startup window.
+            last_signatures[source_addr] = sigs[0].get("signature")
+            while len(seen) > 1000:
+                seen.pop(next(iter(seen)))
+            save_seen_signatures(seen_signatures)
+            if owner_addr not in old_history_skipped:
+                old_history_skipped.add(owner_addr)
+                print(f"⏭️ Ignoring RPC history older than one hour for [{wallet_name}].")
+            if last_sig is None:
+                label = "" if source_addr == owner_addr else " linked signer"
+                print(f"✅ Monitoring active{label} for [{wallet_name}]")
+            return
+
+        new_sigs = [sigs[index] for index in recent_indexes]
+        oldest_recent_index = max(recent_indexes)
+        older_rows = sigs[oldest_recent_index + 1:]
+        last_signatures[source_addr] = (
+            older_rows[0].get("signature") if older_rows else NO_SIGNATURE_BASELINE
+        )
+        while len(seen) > 1000:
+            seen.pop(next(iter(seen)))
+        if last_sig is None:
+            label = "" if source_addr == owner_addr else " linked signer"
+            print(f"✅ Monitoring active{label} for [{wallet_name}]")
 
     for sig_info in reversed(new_sigs):
         sig = sig_info["signature"]
@@ -800,6 +841,15 @@ async def monitor_wallet(session: aiohttp.ClientSession, owner_addr: str, wallet
             last_signatures[source_addr] = sig
             continue
         if sig in inflight_signatures:
+            continue
+
+        # Do not let a lagging provider turn months of history into "new" alerts.
+        # Unknown block times are suppressed here because there is no safe way to
+        # distinguish historical results from current ones without a saved cursor.
+        if not is_within_startup_window(sig_info):
+            seen[sig] = None
+            last_signatures[source_addr] = sig
+            save_seen_signatures(seen_signatures)
             continue
 
         err = sig_info.get("err")
@@ -829,7 +879,10 @@ async def monitor_wallet(session: aiohttp.ClientSession, owner_addr: str, wallet
 
         discover_session_signers(owner_addr, tx_info, sig, linked_signers, last_signatures)
 
-        time_str = datetime.fromtimestamp(block_time).strftime('%Y-%m-%d %H:%M:%S') if block_time else "Unknown"
+        try:
+            time_str = datetime.fromtimestamp(float(block_time)).strftime('%Y-%m-%d %H:%M:%S')
+        except (TypeError, ValueError, OverflowError, OSError):
+            time_str = "Unknown"
         status = "❌ Failed" if err else "✅ Success"
         raw_logs = tx_info.get("meta", {}).get("logMessages", [])
         action_type = quick_detect_action(raw_logs)
@@ -869,12 +922,15 @@ async def monitor_wallet(session: aiohttp.ClientSession, owner_addr: str, wallet
 
 
 async def main():
+    global BOT_STARTED_AT
+    BOT_STARTED_AT = time.time()
     print(f"🚀 Phoenix Tracker Active using [{config_name}.py]...")
     print(
         f"🔌 RPC providers ready: {len(RPC_URLS)} "
         f"(Helius keys: {len(helius_urls)}, backups: {len(backup_rpcs)}, "
         f"timeout: {RPC_TIMEOUT}s, max attempts/request: {RPC_MAX_ATTEMPTS})."
     )
+    print("🕒 Startup catch-up window: the last 60 minutes only.")
     print(f"📊 Phoenix trade-data API endpoints configured: {len(PHOENIX_API_URLS)}.")
     last_signatures = {}
     seen_signatures = load_seen_signatures()
