@@ -1,7 +1,7 @@
 import asyncio
 import aiohttp
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 import sys
 import importlib
 import json
@@ -26,7 +26,7 @@ except ImportError:
 
 # Wallet Configuration
 TARGET_WALLETS = config.TARGET_WALLETS
-POLL_INTERVAL = getattr(config, 'POLL_INTERVAL', 1.5)
+POLL_INTERVAL = getattr(config, 'POLL_INTERVAL', 2)
 TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID = config.TELEGRAM_CHAT_ID
 
@@ -36,7 +36,7 @@ PHOENIX_PROGRAMS = {
     "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih": "Phoenix Eternal (Perps) ⚡"
 }
 
-# Helius + Backup RPC Setup
+# Helius + Backup RPC Setup (Auto-failover enabled)
 HELIUS_API_KEYS = getattr(config, 'HELIUS_API_KEYS', [])
 if not HELIUS_API_KEYS and hasattr(config, 'HELIUS_API_KEY') and config.HELIUS_API_KEY:
     HELIUS_API_KEYS = [config.HELIUS_API_KEY]
@@ -46,21 +46,36 @@ elif isinstance(HELIUS_API_KEYS, str):
 helius_urls = [
     f"https://mainnet.helius-rpc.com/?api-key={quote(str(key).strip(), safe='')}"
     for key in HELIUS_API_KEYS
-    if key and "your-" not in str(key).lower() and "your_" not in str(key).lower()
+    if key
+    and "your-" not in str(key).lower()
+    and "your_" not in str(key).lower()
+    and "placeholder" not in str(key).lower()
+    and "کلید api خودت" not in str(key).casefold()
 ]
 
 configured_rpcs = getattr(config, 'RPC_URLS', [
-    "https://solana-rpc.publicnode.com",
     "https://api.mainnet-beta.solana.com",
+    "https://solana-rpc.publicnode.com",
+    "https://rpc.ankr.com/solana"
 ])
 if isinstance(configured_rpcs, str):
     configured_rpcs = [configured_rpcs]
 
-backup_rpcs = [
-    str(r).strip() for r in configured_rpcs
-    if str(r).strip() and "mainnet.helius-rpc.com" not in str(r).lower()
-]
+# Helius endpoints are built separately for each key above. Ignore the common
+# malformed config entry that interpolates the whole key list into one URL.
+backup_rpcs = []
+for configured_rpc in configured_rpcs:
+    rpc_url = str(configured_rpc).strip()
+    if not rpc_url or rpc_url in backup_rpcs:
+        continue
+    if "mainnet.helius-rpc.com" in rpc_url.lower():
+        if helius_urls:
+            continue
+        if "api-key=" not in rpc_url.lower() or "[" in rpc_url or "]" in rpc_url:
+            continue
+    backup_rpcs.append(rpc_url)
 
+# Combine Primary Helius with Backup RPCs
 RPC_URLS = list(dict.fromkeys(helius_urls + backup_rpcs))
 rpc_round_robin_index = 0
 
@@ -69,8 +84,7 @@ last_rpc_error_warn_time = 0
 SEEN_SIGNATURES_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "seen_signatures.json"
 )
-# افزایش هم‌زمانی برای جلوگیری از ایجاد صف طولانی
-RPC_CONCURRENCY = max(1, int(getattr(config, "RPC_CONCURRENCY", 10)))
+RPC_CONCURRENCY = max(1, int(getattr(config, "RPC_CONCURRENCY", 3)))
 rpc_semaphore = asyncio.Semaphore(RPC_CONCURRENCY)
 last_signature_gap_warn = {}
 
@@ -79,7 +93,9 @@ def load_seen_signatures():
     try:
         with open(SEEN_SIGNATURES_FILE, "r", encoding="utf-8") as file:
             saved = json.load(file)
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError):
         return {}
 
     if not isinstance(saved, dict):
@@ -98,6 +114,7 @@ def save_seen_signatures(seen_signatures):
         wallet: list(signatures.keys())[-1000:]
         for wallet, signatures in seen_signatures.items()
     }
+
     try:
         with open(temp_path, "w", encoding="utf-8") as file:
             json.dump(saved, file)
@@ -107,6 +124,7 @@ def save_seen_signatures(seen_signatures):
 
 
 def get_next_rpc_index():
+    """Choose a different first provider for each request without interleaving retries."""
     global rpc_round_robin_index
     if not RPC_URLS:
         return None
@@ -117,6 +135,7 @@ def get_next_rpc_index():
 
 async def send_telegram_alert(session: aiohttp.ClientSession, message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram bot token or chat ID is missing from the active config.")
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -130,7 +149,7 @@ async def send_telegram_alert(session: aiohttp.ClientSession, message: str):
             data = await resp.json(content_type=None)
             if resp.status == 200 and data.get("ok"):
                 return data.get("result", {}).get("message_id")
-            print(f"⚠️ Telegram send failed (HTTP {resp.status}): {str(data)[:200]}")
+            print(f"⚠️ Telegram send failed (HTTP {resp.status}): {str(data)[:250]}")
     except Exception as exc:
         print(f"⚠️ Telegram send failed: {type(exc).__name__}")
     return None
@@ -150,48 +169,77 @@ async def edit_telegram_alert(session: aiohttp.ClientSession, message_id: int, m
     try:
         async with session.post(url, json=payload, timeout=5) as resp:
             if resp.status != 200:
-                error_text = (await resp.text())[:200]
+                error_text = (await resp.text())[:250]
                 print(f"⚠️ Telegram could not add trade details ({resp.status}): {error_text}")
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"⚠️ Telegram detail update failed: {type(exc).__name__}")
 
 
 async def fetch_rpc(session: aiohttp.ClientSession, method: str, params: list):
     global last_429_warn_time, last_rpc_error_warn_time
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    total_urls = len(RPC_URLS)
-    if not total_urls:
+    attempts = len(RPC_URLS)
+    if not attempts:
+        print("⚠️ No valid RPC endpoint is configured.")
         return None
 
-    # حداکثر ۳ تلاش سریع برای جلوگیری از فریز شدن صف روی RPCهای کند
-    max_attempts = min(3, total_urls)
     first_index = get_next_rpc_index()
     if first_index is None:
         return None
-
-    for offset in range(max_attempts):
-        provider_index = (first_index + offset) % total_urls
+    invalid_param_error = None
+    for offset in range(attempts):
+        provider_index = (first_index + offset) % attempts
         rpc_url = RPC_URLS[provider_index]
+        provider_label = f"RPC #{provider_index + 1}/{attempts}"
         try:
             async with rpc_semaphore:
-                # تایم‌اوت کوتاه ۲.۵ ثانیه‌ای برای جلوگیری از ایجاد تأخیر انباشته
-                async with session.post(rpc_url, json=payload, timeout=2.5) as resp:
+                async with session.post(rpc_url, json=payload, timeout=5) as resp:
                     if resp.status == 200:
                         data = await resp.json(content_type=None)
                         if data.get("result") is not None:
                             return data["result"]
+                        if data.get("error"):
+                            now = time.time()
+                            if now - last_rpc_error_warn_time > 15:
+                                last_rpc_error_warn_time = now
+                                error = data["error"]
+                                if isinstance(error, dict):
+                                    detail = f"{error.get('code', '')} {error.get('message', '')}".strip()
+                                else:
+                                    detail = str(error)
+                                print(f"⚠️ {provider_label} JSON error in {method} ({detail[:180]}).")
+                            error = data["error"]
+                            if isinstance(error, dict) and error.get("code") == -32602:
+                                # Test one alternate provider, then stop if it reports
+                                # the same invalid-parameter error for the same request.
+                                error_text = str(error.get("message", ""))
+                                if invalid_param_error == error_text:
+                                    return None
+                                invalid_param_error = error_text
+                            print(f"↪️ Retrying {method} with the next RPC/key...")
+                            continue
                     elif resp.status == 429:
                         now = time.time()
                         if now - last_429_warn_time > 15:
                             last_429_warn_time = now
-                            print(f"⏳ RPC #{provider_index + 1} rate limit (429); switching key...")
+                            print(f"⏳ {provider_label} rate limit (429) in {method}; trying the next key/endpoint...")
                         continue
-        except Exception:
+                    else:
+                        now = time.time()
+                        if now - last_rpc_error_warn_time > 15:
+                            last_rpc_error_warn_time = now
+                            print(f"⚠️ {provider_label} returned HTTP {resp.status} for {method}; trying the next key/endpoint...")
+        except Exception as exc:
+            now = time.time()
+            if now - last_rpc_error_warn_time > 15:
+                last_rpc_error_warn_time = now
+                print(f"⚠️ RPC request failed ({type(exc).__name__}); trying the next key/endpoint...")
             continue
     return None
 
 
 def get_phoenix_type(tx_info: dict) -> str:
+    """Detects whether the transaction interacted with Phoenix Spot or Eternal."""
     if not tx_info:
         return None
     try:
@@ -207,28 +255,27 @@ def get_phoenix_type(tx_info: dict) -> str:
 
 
 def quick_detect_action(logs: list) -> str:
+    """Parses transaction logs to determine the action type."""
     if not logs:
         return "⚡ معامله / مدیریت سفارش"
     
     logs_str = " ".join(logs).lower()
-    if "placelimit" in logs_str or "place_limit" in logs_str or "limitorder" in logs_str:
+    if "placelimit" in logs_str or "place_limit" in logs_str:
         return "📥 ثبت سفارش لیمیت (Limit Order)"
-    elif "placemarket" in logs_str or "place_market" in logs_str or "marketorder" in logs_str:
+    elif "placemarket" in logs_str or "place_market" in logs_str:
         return "⚡ معامله مارکت (Market Order)"
     elif "cancel" in logs_str:
         return "❌ لغو سفارش (Cancel Order)"
-    elif "deposit" in logs_str or "withdraw" in logs_str:
-        return "💳 واریز / برداشت مارجین"
     
     return "⚡ معامله / مدیریت سفارش"
 
 
-# =====================================================================
-# --- Phoenix Eternal Trade Details Enrichment ---
-# =====================================================================
+# Public Phoenix endpoints used for exact fill size, price, fees, and realized PnL.
+# This is data formatting only; no AI request or generated analysis is used.
 PHOENIX_API_URL = getattr(config, "PHOENIX_API_URL", "https://perp-api.phoenix.trade").rstrip("/")
-PHOENIX_API_TIMEOUT = getattr(config, "PHOENIX_API_TIMEOUT", 5)
-PHOENIX_API_PAGES = max(1, int(getattr(config, "PHOENIX_API_PAGES", 2)))
+PHOENIX_API_TIMEOUT = getattr(config, "PHOENIX_API_TIMEOUT", 6)
+PHOENIX_API_PAGES = max(1, int(getattr(config, "PHOENIX_API_PAGES", 3)))
+last_phoenix_api_warn_time = 0
 
 
 def as_decimal(value):
@@ -247,9 +294,10 @@ def timestamp_ms(value):
             return int(number if number > Decimal("100000000000") else number * 1000)
         parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
         if parsed.tzinfo is None:
+            from datetime import timezone
             parsed = parsed.replace(tzinfo=timezone.utc)
         return int(parsed.timestamp() * 1000)
-    except Exception:
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
         return None
 
 
@@ -261,15 +309,24 @@ def format_number(value, decimals=8):
 
 
 async def phoenix_api_get(session, path, params=None):
+    global last_phoenix_api_warn_time
     try:
         async with session.get(
             f"{PHOENIX_API_URL}{path}", params=params, timeout=PHOENIX_API_TIMEOUT
         ) as resp:
             if resp.status != 200:
+                now = time.time()
+                if now - last_phoenix_api_warn_time > 30:
+                    last_phoenix_api_warn_time = now
+                    print(f"⚠️ Phoenix trade-data API returned HTTP {resp.status}; the basic alert was kept.")
                 return None
             payload = await resp.json(content_type=None)
             return payload if isinstance(payload, dict) else None
-    except Exception:
+    except Exception as exc:
+        now = time.time()
+        if now - last_phoenix_api_warn_time > 30:
+            last_phoenix_api_warn_time = now
+            print(f"⚠️ Phoenix trade-data request failed: {type(exc).__name__}; the basic alert was kept.")
         return None
 
 
@@ -336,13 +393,14 @@ async def fetch_market_fills(session, symbol, signature, history_rows):
 async def fetch_phoenix_trade_details(session, wallet_addr, signature):
     path = f"/v1/trader/{quote(wallet_addr, safe='')}/trades-history"
     history_rows = []
-    for attempt in range(4):
+    for attempt in range(3):
         history_rows = await fetch_rows_for_signature(session, path, signature)
         if history_rows:
             break
-        if attempt < 3:
-            await asyncio.sleep(1.0)
+        if attempt < 2:
+            await asyncio.sleep(0.7)
     if not history_rows:
+        print(f"ℹ️ Phoenix has not indexed trade details yet for {signature[:8]}.")
         return []
 
     grouped = {}
@@ -414,6 +472,8 @@ def build_trade_details(markets):
         lines = [f"🪙 <b>{symbol}</b> · {metrics['side']}"]
         if metrics["base_qty"] is not None:
             lines.append(f"📦 حجم اجراشده: <b>{format_number(metrics['base_qty'])} {symbol}</b>")
+        else:
+            lines.append("📦 حجم اجراشده: نامشخص")
         if metrics["price"] is not None:
             lines.append(f"💹 میانگین قیمت اجرا: <b>{format_number(metrics['price'])} PhUSD</b>")
         if metrics["quote_qty"] is not None:
@@ -455,78 +515,15 @@ def build_trade_details(markets):
         if metrics["liquidity"]:
             lines.append(f"💧 نقدشوندگی: {html.escape(', '.join(metrics['liquidity']))}")
         sections.append("\n".join(lines))
+    if len(markets) > 5:
+        sections.append(f"… و {len(markets) - 5} بازار دیگر")
     return "\n\n".join(sections)
-
-
-async def dispatch_alert_background(session, alert_text, wallet_addr, sig, phoenix_market_type, is_failed):
-    """ارسال فوری پیام و تکمیل جزئیات در پس‌زمینه بدون مسدود کردن حلقه اصلی"""
-    message_id = await send_telegram_alert(session, alert_text)
-    if not message_id:
-        return
-
-    if not is_failed and phoenix_market_type == "Phoenix Eternal (Perps) ⚡":
-        try:
-            markets = await fetch_phoenix_trade_details(session, wallet_addr, sig)
-            details_text = build_trade_details(markets)
-            if details_text:
-                await edit_telegram_alert(session, message_id, alert_text + details_text)
-        except Exception as exc:
-            print(f"⚠️ Trade details failed for {sig[:8]}: {type(exc).__name__}")
-
-
-async def process_single_signature(session, wallet_addr, wallet_name, sig_info, seen, seen_signatures):
-    """بررسی موازی یک تراکنش جهت جلوگیری از گیر کردن صف"""
-    sig = sig_info["signature"]
-    if sig in seen:
-        return
-
-    err = sig_info.get("err")
-    block_time = sig_info.get("blockTime")
-    tx_info = await fetch_rpc(
-        session,
-        "getTransaction",
-        [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
-    )
-    if not tx_info:
-        return
-
-    seen[sig] = None
-    if len(seen) > 1000:
-        seen.pop(next(iter(seen)))
-
-    phoenix_market_type = get_phoenix_type(tx_info)
-    if not phoenix_market_type:
-        return
-
-    time_str = datetime.fromtimestamp(block_time).strftime('%Y-%m-%d %H:%M:%S') if block_time else "Unknown"
-    status = "❌ Failed" if err else "✅ Success"
-    raw_logs = tx_info.get("meta", {}).get("logMessages", [])
-    action_type = quick_detect_action(raw_logs)
-    phoenix_portfolio_url = f"https://www.phoenix.trade/portfolio?ghost={wallet_addr}"
-
-    alert_text = (
-        f"🦅 <b>تراکنش جدید Phoenix ثبت شد!</b>\n\n"
-        f"🏷 <b>نام ولت:</b> {html.escape(wallet_name)}\n"
-        f"🏢 <b>بخش:</b> {html.escape(phoenix_market_type)}\n"
-        f"👤 <b>آدرس:</b> <code>{wallet_addr[:6]}...{wallet_addr[-4:]}</code>\n"
-        f"📌 <b>نوع دستور:</b> {action_type}\n"
-        f"📊 <b>وضعیت:</b> {status}\n"
-        f"⏰ <b>زمان:</b> {time_str}\n\n"
-        f"💡 <i>جهت مشاهده جزئیات پوزیشن و پورتفولیو:</i>\n"
-        f"🔗 <a href='https://solscan.io/tx/{sig}'>مشاهده تراکنش در Solscan</a>\n"
-        f"🦅 <a href='{phoenix_portfolio_url}'>مشاهده پورتفولیو زنده در Phoenix</a>"
-    )
-
-    asyncio.create_task(
-        dispatch_alert_background(session, alert_text, wallet_addr, sig, phoenix_market_type, bool(err))
-    )
-    print(f"⚡ Alert triggered [{phoenix_market_type}] for {wallet_name}: {sig[:8]}")
 
 
 async def monitor_wallet(session: aiohttp.ClientSession, wallet_addr: str, wallet_name: str, last_signatures: dict, seen_signatures: dict):
     wallet_addr = str(wallet_addr).strip()
     wallet_name = str(wallet_name)
-    sigs = await fetch_rpc(session, "getSignaturesForAddress", [wallet_addr, {"limit": 15}])
+    sigs = await fetch_rpc(session, "getSignaturesForAddress", [wallet_addr, {"limit": 20}])
     if not sigs:
         return
 
@@ -541,31 +538,101 @@ async def monitor_wallet(session: aiohttp.ClientSession, wallet_addr: str, walle
         return
 
     new_sigs = []
+    baseline_found = False
     for sig_info in sigs:
         sig = sig_info["signature"]
-        if sig == last_sig or sig in seen:
+        if sig == last_sig:
+            baseline_found = True
             break
         new_sigs.append(sig_info)
 
-    if new_sigs:
-        last_signatures[wallet_addr] = new_sigs[0]["signature"]
-        # بررسی هم‌زمان (موازی) تمام امضاهای جدید بدون قفل کردن صف
-        tx_tasks = [
-            process_single_signature(session, wallet_addr, wallet_name, sig_info, seen, seen_signatures)
-            for sig_info in reversed(new_sigs)
-        ]
-        await asyncio.gather(*tx_tasks)
+    if not baseline_found:
+        # Multiple RPCs may have different history heads. Do not advance to an
+        # unverified page and accidentally replay it; the round-robin will try
+        # a different key/provider on the next request.
+        now = time.time()
+        if now - last_signature_gap_warn.get(wallet_addr, 0) > 15:
+            last_signature_gap_warn[wallet_addr] = now
+            print(f"⏳ RPC history for [{wallet_name}] missed its cursor; waiting for another provider.")
+        return
+
+    for sig_info in reversed(new_sigs):
+        sig = sig_info["signature"]
+        if sig in seen:
+            last_signatures[wallet_addr] = sig
+            continue
+
+        err = sig_info.get("err")
+        block_time = sig_info.get("blockTime")
+        tx_info = await fetch_rpc(
+            session,
+            "getTransaction",
+            [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+        )
+        if not tx_info:
+            # Leave this signature pending. The next polling cycle can retry it
+            # through another RPC key instead of silently losing the event.
+            print(f"⏳ Could not fetch transaction {sig[:8]}; keeping it pending for RPC failover.")
+            break
+
+        phoenix_market_type = get_phoenix_type(tx_info)
+        if not phoenix_market_type:
+            seen[sig] = None
+            last_signatures[wallet_addr] = sig
+            if len(seen) > 1000:
+                seen.pop(next(iter(seen)))
+            save_seen_signatures(seen_signatures)
+            continue
+
+        time_str = datetime.fromtimestamp(block_time).strftime('%Y-%m-%d %H:%M:%S') if block_time else "Unknown"
+        status = "❌ Failed" if err else "✅ Success"
+        raw_logs = tx_info.get("meta", {}).get("logMessages", [])
+        action_type = quick_detect_action(raw_logs)
+        phoenix_portfolio_url = f"https://www.phoenix.trade/portfolio?ghost={wallet_addr}"
+        alert_text = (
+            f"🦅 <b>تراکنش جدید Phoenix ثبت شد!</b>\n\n"
+            f"🏷 <b>نام ولت:</b> {html.escape(wallet_name)}\n"
+            f"🏢 <b>بخش:</b> {html.escape(phoenix_market_type)}\n"
+            f"👤 <b>آدرس:</b> <code>{wallet_addr[:6]}...{wallet_addr[-4:]}</code>\n"
+            f"📌 <b>نوع دستور:</b> {action_type}\n"
+            f"📊 <b>وضعیت:</b> {status}\n"
+            f"⏰ <b>زمان:</b> {time_str}\n\n"
+            f"💡 <i>جهت مشاهده جزئیات پوزیشن و پورتفولیو:</i>\n"
+            f"🔗 <a href='https://solscan.io/tx/{sig}'>مشاهده تراکنش در Solscan</a>\n"
+            f"🦅 <a href='{phoenix_portfolio_url}'>مشاهده پورتفولیو زنده در Phoenix</a>"
+        )
+
+        message_id = await send_telegram_alert(session, alert_text)
+        if not message_id:
+            # Don't mark the event as delivered when Telegram rejected the send.
+            print(f"⚠️ Telegram did not confirm alert {sig[:8]}; keeping it pending for retry.")
+            break
+
+        seen[sig] = None
+        last_signatures[wallet_addr] = sig
+        if len(seen) > 1000:
+            seen.pop(next(iter(seen)))
         save_seen_signatures(seen_signatures)
+        print(f"⚡ Alert sent [{phoenix_market_type}] for {wallet_name}: {sig[:8]}")
+
+        if not err and phoenix_market_type == "Phoenix Eternal (Perps) ⚡":
+            try:
+                markets = await fetch_phoenix_trade_details(session, wallet_addr, sig)
+                details_text = build_trade_details(markets)
+                if details_text:
+                    await edit_telegram_alert(session, message_id, alert_text + details_text)
+            except Exception as exc:
+                print(f"⚠️ Trade details failed for {sig[:8]}: {type(exc).__name__}")
 
 
 async def main():
-    print(f"🚀 High-Speed Phoenix Tracker Active using [{config_name}.py]...")
+    print(f"🚀 Phoenix Tracker Active using [{config_name}.py]...")
     print(f"🔌 RPC providers ready: {len(RPC_URLS)} (Helius keys: {len(helius_urls)}, backups: {len(backup_rpcs)}).")
     last_signatures = {}
     seen_signatures = load_seen_signatures()
 
     async with aiohttp.ClientSession() as session:
-        await send_telegram_alert(session, f"🚀 <b>High-Speed Phoenix Tracker Active ({config_name}.py).</b>")
+        await send_telegram_alert(session, f"🚀 <b>Phoenix Multi-Wallet Tracker Active ({config_name}.py).</b>")
 
         while True:
             start_time = time.time()
